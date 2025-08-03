@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+# queryhybrid.py (batched scoring version)
+
+import argparse
+import json
+import torch
+from sentence_transformers import SentenceTransformer, util
+
+def clean_json(data):
+    if isinstance(data, dict):
+        return {k: clean_json(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [clean_json(i) for i in data]
+    elif isinstance(data, float) and (data != data):  # NaN check
+        return ""
+    return data
+
+def main():
+    parser = argparse.ArgumentParser(description="Query hybrid embeddings (batched scoring)")
+    parser.add_argument("query", type=str, help="The search query")
+    parser.add_argument("--file", type=str, default="hybrid_embeddings.jsonl", help="Path to embeddings file")
+    parser.add_argument("--type", choices=["idea", "article", "both"], default="both", help="Type of entry to search")
+    parser.add_argument("-n", type=int, default=5, help="Number of results to return")
+    parser.add_argument("--score", type=float, default=0.0, help="Minimum similarity score to include")
+    args = parser.parse_args()
+
+    # Select device
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    #query_emb = model.encode(args.query, convert_to_tensor=True).to(device)
+    query_emb = model.encode(args.query, convert_to_tensor=True)
+
+    # Load and filter data
+    data = []
+    embeddings = []
+    with open(args.file, "r", encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
+            if args.type != "both" and obj.get("Type") != args.type:
+                continue
+            if "embedding" not in obj:
+                continue
+            emb = torch.tensor(obj["embedding"], dtype=torch.float32)
+            data.append(obj)
+            embeddings.append(emb)
+
+    if not embeddings:
+        print("No matching entries found.")
+        return
+
+    # Batch to device
+    #embedding_tensor = torch.stack(embeddings).to(device)
+    embedding_tensor = torch.stack(embeddings)
+    scores = util.dot_score(query_emb, embedding_tensor)[0]  # Shape: (N,)
+
+    # Collect results
+    results = []
+    for idx, score in enumerate(scores):
+        score_val = float(score)
+        if score_val >= args.score:
+            item = data[idx]
+            item.pop("embedding", None)
+            item = clean_json(item)
+            results.append((score_val, item))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+
+    for score, item in results[:args.n]:
+        print(f"\n🧠 Type: {item.get('Type')} — Score: {score:.4f}")
+        print(json.dumps(item, indent=2, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
